@@ -143,34 +143,364 @@ graph TB
 - **Redis** 7.0+ (optional, for caching)
 - **Docker** & **Docker Compose** (for containerized deployment)
 
-### Installation
+## 🔧 Core Technical Implementation
 
-```bash
-# Clone the repository
-git clone https://github.com/your-username/logistics-backend.git
-cd logistics-backend
+### Event-Driven Architecture with Message Queues
 
-# Install dependencies
-npm install
+Our logistics platform implements a sophisticated event-driven architecture to handle high-frequency delivery updates and real-time notifications:
 
-# Set up environment variables
-cp .env.example .env
+```typescript
+// Event Bus Implementation
+@Injectable()
+export class EventBus {
+  private readonly eventEmitter: EventEmitter;
+  private readonly messageQueue: Bull.Queue;
+  private readonly eventHandlers: Map<string, EventHandler[]> = new Map();
 
-# Start MongoDB (if not running)
-mongod
+  constructor(
+    private readonly redisService: RedisService,
+    private readonly logger: Logger
+  ) {
+    this.eventEmitter = new EventEmitter();
+    this.messageQueue = new Bull("event-queue", {
+      redis: process.env.REDIS_URL,
+      defaultJobOptions: {
+        removeOnComplete: 100,
+        removeOnFail: 50,
+        attempts: 3,
+        backoff: { type: "exponential", delay: 2000 },
+      },
+    });
 
-# Run the application
-npm run dev
+    this.initializeEventProcessors();
+  }
+
+  async publishEvent<T>(eventName: string, payload: T): Promise<void> {
+    // Emit for real-time subscribers
+    this.eventEmitter.emit(eventName, payload);
+
+    // Queue for persistent processing
+    await this.messageQueue.add(eventName, {
+      payload,
+      timestamp: Date.now(),
+      eventId: this.generateEventId(),
+    });
+
+    // Store in event log for audit
+    await this.storeEventLog(eventName, payload);
+  }
+
+  private async initializeEventProcessors(): Promise<void> {
+    // Process delivery status updates
+    this.messageQueue.process("delivery.status.updated", async (job) => {
+      const { payload } = job.data;
+
+      await Promise.all([
+        this.updateDeliveryAnalytics(payload),
+        this.notifyStakeholders(payload),
+        this.updateExternalSystems(payload),
+      ]);
+    });
+
+    // Process route optimization requests
+    this.messageQueue.process("route.optimization.requested", async (job) => {
+      const { payload } = job.data;
+
+      const optimizedRoute = await this.routeOptimizationService.optimize(
+        payload
+      );
+      await this.publishEvent("route.optimization.completed", optimizedRoute);
+    });
+  }
+}
 ```
 
-### Docker Deployment
+### Advanced Caching Strategy with Redis
 
-```bash
-# Start all services with Docker Compose
-docker-compose up -d
+Multi-layered caching implementation for optimal performance:
 
-# View logs
-docker-compose logs -f
+```typescript
+// Intelligent Caching Service
+@Injectable()
+export class CacheService {
+  private readonly redis: Redis;
+  private readonly localCache: Map<string, CacheEntry> = new Map();
+  private readonly cacheConfig: CacheConfig;
+
+  constructor() {
+    this.redis = new Redis(process.env.REDIS_URL);
+    this.cacheConfig = this.loadCacheConfig();
+  }
+
+  async get<T>(key: string, fallback?: () => Promise<T>): Promise<T | null> {
+    // L1: Local memory cache (fastest)
+    const localEntry = this.localCache.get(key);
+    if (localEntry && !this.isExpired(localEntry)) {
+      return localEntry.data as T;
+    }
+
+    // L2: Redis cache
+    const redisData = await this.redis.get(key);
+    if (redisData) {
+      const parsed = JSON.parse(redisData);
+      this.localCache.set(key, {
+        data: parsed,
+        timestamp: Date.now(),
+        ttl: this.cacheConfig.defaultTTL,
+      });
+      return parsed;
+    }
+
+    // L3: Fallback to data source
+    if (fallback) {
+      const data = await fallback();
+      await this.set(key, data);
+      return data;
+    }
+
+    return null;
+  }
+
+  async set<T>(key: string, data: T, ttl?: number): Promise<void> {
+    const cacheTTL = ttl || this.cacheConfig.defaultTTL;
+
+    // Update local cache
+    this.localCache.set(key, {
+      data,
+      timestamp: Date.now(),
+      ttl: cacheTTL,
+    });
+
+    // Update Redis cache
+    await this.redis.setex(key, cacheTTL, JSON.stringify(data));
+  }
+
+  private isExpired(entry: CacheEntry): boolean {
+    return Date.now() - entry.timestamp > entry.ttl * 1000;
+  }
+}
+```
+
+### Database Optimization with MongoDB Aggregation
+
+Sophisticated query optimization for complex logistics data:
+
+```typescript
+// Optimized Delivery Repository
+@Injectable()
+export class DeliveryRepository {
+  constructor(
+    private readonly database: Database,
+    private readonly cacheService: CacheService
+  ) {}
+
+  async findDeliveriesWithOptimization(
+    filters: DeliveryFilters,
+    options: QueryOptions
+  ): Promise<DeliveryWithAnalytics[]> {
+    const cacheKey = this.generateCacheKey(filters, options);
+
+    return this.cacheService.get(cacheKey, async () => {
+      const pipeline = [
+        // Match stage for filtering
+        { $match: this.buildMatchStage(filters) },
+
+        // Lookup related data
+        {
+          $lookup: {
+            from: "drivers",
+            localField: "driverId",
+            foreignField: "_id",
+            as: "driver",
+          },
+        },
+
+        // Lookup route information
+        {
+          $lookup: {
+            from: "routes",
+            localField: "routeId",
+            foreignField: "_id",
+            as: "route",
+          },
+        },
+
+        // Calculate analytics
+        {
+          $addFields: {
+            estimatedDuration: {
+              $divide: [
+                { $arrayElemAt: ["$route.distance", 0] },
+                { $arrayElemAt: ["$route.averageSpeed", 0] },
+              ],
+            },
+            efficiencyScore: {
+              $multiply: [
+                { $divide: ["$actualDuration", "$estimatedDuration"] },
+                100,
+              ],
+            },
+          },
+        },
+
+        // Sort and paginate
+        { $sort: options.sort || { createdAt: -1 } },
+        { $skip: options.skip || 0 },
+        { $limit: options.limit || 50 },
+      ];
+
+      return this.database
+        .collection("deliveries")
+        .aggregate(pipeline)
+        .toArray();
+    });
+  }
+
+  async getDeliveryAnalytics(
+    tenantId: string,
+    dateRange: DateRange
+  ): Promise<DeliveryAnalytics> {
+    const pipeline = [
+      {
+        $match: {
+          tenantId,
+          createdAt: { $gte: dateRange.start, $lte: dateRange.end },
+        },
+      },
+
+      {
+        $group: {
+          _id: {
+            status: "$status",
+            date: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+          },
+          count: { $sum: 1 },
+          totalDistance: { $sum: "$distance" },
+          averageDuration: { $avg: "$duration" },
+        },
+      },
+
+      {
+        $group: {
+          _id: "$_id.date",
+          statuses: {
+            $push: {
+              status: "$_id.status",
+              count: "$count",
+              totalDistance: "$totalDistance",
+              averageDuration: "$averageDuration",
+            },
+          },
+        },
+      },
+    ];
+
+    return this.database.collection("deliveries").aggregate(pipeline).toArray();
+  }
+}
+```
+
+### Real-time WebSocket Integration
+
+WebSocket implementation for live delivery tracking and notifications:
+
+```typescript
+// WebSocket Manager
+@Injectable()
+export class WebSocketManager {
+  private readonly wss: WebSocketServer;
+  private readonly clients: Map<string, WebSocket> = new Map();
+  private readonly subscriptions: Map<string, Set<string>> = new Map();
+
+  constructor(
+    private readonly eventBus: EventBus,
+    private readonly authService: AuthService
+  ) {
+    this.wss = new WebSocketServer({ port: 8080 });
+    this.initializeWebSocketServer();
+    this.subscribeToEvents();
+  }
+
+  private initializeWebSocketServer(): void {
+    this.wss.on(
+      "connection",
+      async (ws: WebSocket, request: IncomingMessage) => {
+        try {
+          // Authenticate connection
+          const token = this.extractToken(request);
+          const user = await this.authService.verifyToken(token);
+
+          const clientId = user.id;
+          this.clients.set(clientId, ws);
+
+          // Handle client messages
+          ws.on("message", (message: string) => {
+            this.handleClientMessage(clientId, JSON.parse(message));
+          });
+
+          // Handle client disconnect
+          ws.on("close", () => {
+            this.handleClientDisconnect(clientId);
+          });
+
+          // Send initial connection confirmation
+          ws.send(
+            JSON.stringify({
+              type: "connection_established",
+              clientId,
+              timestamp: Date.now(),
+            })
+          );
+        } catch (error) {
+          ws.close(1008, "Authentication failed");
+        }
+      }
+    );
+  }
+
+  private handleClientMessage(clientId: string, message: any): void {
+    switch (message.type) {
+      case "subscribe_delivery":
+        this.subscribeToDelivery(clientId, message.deliveryId);
+        break;
+      case "unsubscribe_delivery":
+        this.unsubscribeFromDelivery(clientId, message.deliveryId);
+        break;
+      case "ping":
+        this.sendToClient(clientId, { type: "pong", timestamp: Date.now() });
+        break;
+    }
+  }
+
+  private subscribeToEvents(): void {
+    // Subscribe to delivery updates
+    this.eventBus.subscribe("delivery.status.updated", (event) => {
+      this.broadcastToSubscribers("delivery.status.updated", event);
+    });
+
+    // Subscribe to route updates
+    this.eventBus.subscribe("route.optimization.completed", (event) => {
+      this.broadcastToSubscribers("route.optimization.completed", event);
+    });
+  }
+
+  private broadcastToSubscribers(eventType: string, data: any): void {
+    const subscribers = this.subscriptions.get(eventType) || new Set();
+
+    subscribers.forEach((clientId) => {
+      const client = this.clients.get(clientId);
+      if (client && client.readyState === WebSocket.OPEN) {
+        client.send(
+          JSON.stringify({
+            type: eventType,
+            data,
+            timestamp: Date.now(),
+          })
+        );
+      }
+    });
+  }
+}
 ```
 
 ## 📡 API Reference
