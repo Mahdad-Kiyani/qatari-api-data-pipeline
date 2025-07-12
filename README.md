@@ -145,8 +145,6 @@ graph TB
 
 ### Installation
 
-#### Option 1: Local Development
-
 ```bash
 # Clone the repository
 git clone https://github.com/your-username/logistics-backend.git
@@ -157,7 +155,6 @@ npm install
 
 # Set up environment variables
 cp .env.example .env
-# Edit .env with your configuration
 
 # Start MongoDB (if not running)
 mongod
@@ -166,60 +163,14 @@ mongod
 npm run dev
 ```
 
-#### Option 2: Docker Deployment
+### Docker Deployment
 
 ```bash
-# Clone the repository
-git clone https://github.com/your-username/logistics-backend.git
-cd logistics-backend
-
 # Start all services with Docker Compose
 docker-compose up -d
 
 # View logs
 docker-compose logs -f
-```
-
-### Environment Variables
-
-Create a `.env` file in the root directory:
-
-```env
-# Server Configuration
-NODE_ENV=development
-PORT=3000
-API_VERSION=v1
-
-# Database Configuration
-MONGODB_URI=mongodb://localhost:27017/logistics
-MONGODB_URI_TEST=mongodb://localhost:27017/logistics-test
-
-# JWT Configuration
-JWT_SECRET=your-super-secret-jwt-key
-JWT_EXPIRES_IN=24h
-JWT_REFRESH_EXPIRES_IN=7d
-
-# Redis Configuration (Optional)
-REDIS_URL=redis://localhost:6379
-
-# External APIs
-GOOGLE_MAPS_API_KEY=your-google-maps-api-key
-WEATHER_API_KEY=your-weather-api-key
-
-# Email Configuration
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USER=your-email@gmail.com
-SMTP_PASS=your-app-password
-
-# SMS Configuration
-TWILIO_ACCOUNT_SID=your-twilio-sid
-TWILIO_AUTH_TOKEN=your-twilio-token
-TWILIO_PHONE_NUMBER=your-twilio-number
-
-# Rate Limiting
-RATE_LIMIT_WINDOW_MS=900000
-RATE_LIMIT_MAX_REQUESTS=100
 ```
 
 ## 📡 API Reference
@@ -325,6 +276,759 @@ curl -X PATCH http://localhost:3000/api/v1/deliveries/delivery_id/status \
   }'
 ```
 
+## 🧠 Technical Challenges & Solutions
+
+### 1. Real-time GPS Tracking with High-Frequency Updates
+
+**Challenge**: Processing and storing GPS coordinates from hundreds of drivers simultaneously while maintaining sub-second response times for real-time tracking.
+
+**Solution**: Implemented a multi-layered caching strategy with Redis streams and MongoDB time-series collections:
+
+```typescript
+// Real-time GPS Tracking Service
+@Injectable()
+export class GPSTrackingService {
+  private readonly redisClient: Redis;
+  private readonly trackingStream = "gps_tracking_stream";
+  private readonly batchSize = 100;
+  private readonly flushInterval = 5000; // 5 seconds
+
+  constructor(
+    private readonly deliveryService: DeliveryService,
+    private readonly notificationService: NotificationService
+  ) {
+    this.redisClient = new Redis(process.env.REDIS_URL);
+    this.initializeTrackingProcessor();
+  }
+
+  async updateLocation(
+    deliveryId: string,
+    coordinates: GPSLocation,
+    driverId: string
+  ): Promise<void> {
+    const trackingData = {
+      deliveryId,
+      driverId,
+      latitude: coordinates.latitude,
+      longitude: coordinates.longitude,
+      timestamp: Date.now(),
+      speed: coordinates.speed,
+      heading: coordinates.heading,
+    };
+
+    // Store in Redis stream for real-time access
+    await this.redisClient.xadd(
+      this.trackingStream,
+      "*",
+      "data",
+      JSON.stringify(trackingData)
+    );
+
+    // Batch write to MongoDB for persistence
+    await this.batchWriteToMongo(trackingData);
+
+    // Trigger real-time notifications
+    await this.notificationService.broadcastLocationUpdate(
+      deliveryId,
+      trackingData
+    );
+  }
+
+  private async batchWriteToMongo(trackingData: TrackingData): Promise<void> {
+    const collection = this.getTimeSeriesCollection();
+
+    await collection.insertOne({
+      ...trackingData,
+      _id: new ObjectId(),
+      createdAt: new Date(trackingData.timestamp),
+    });
+
+    // Create TTL index for automatic cleanup
+    await collection.createIndex(
+      { createdAt: 1 },
+      { expireAfterSeconds: 30 * 24 * 60 * 60 } // 30 days
+    );
+  }
+
+  async getRealTimeLocation(deliveryId: string): Promise<TrackingData | null> {
+    // First check Redis for latest data
+    const latestData = await this.redisClient.xrevrange(
+      this.trackingStream,
+      "+",
+      "-",
+      "COUNT",
+      1
+    );
+
+    if (latestData.length > 0) {
+      const [_, fields] = latestData[0];
+      const data = JSON.parse(fields[1]);
+      if (data.deliveryId === deliveryId) {
+        return data;
+      }
+    }
+
+    // Fallback to MongoDB
+    return this.getLatestFromMongo(deliveryId);
+  }
+}
+```
+
+### 2. Dynamic Route Optimization with Real-time Constraints
+
+**Challenge**: Optimizing delivery routes in real-time while considering traffic conditions, weather, vehicle capacity, and delivery time windows.
+
+**Solution**: Implemented a hybrid optimization algorithm combining genetic algorithms with real-time constraint checking:
+
+```typescript
+// Advanced Route Optimization Service
+@Injectable()
+export class RouteOptimizationService {
+  private readonly geneticAlgorithm: GeneticAlgorithm;
+  private readonly trafficService: TrafficService;
+  private readonly weatherService: WeatherService;
+
+  constructor(
+    private readonly deliveryService: DeliveryService,
+    private readonly vehicleService: VehicleService
+  ) {
+    this.geneticAlgorithm = new GeneticAlgorithm({
+      populationSize: 100,
+      mutationRate: 0.1,
+      crossoverRate: 0.8,
+      generations: 50,
+    });
+  }
+
+  async optimizeRoutes(
+    deliveries: Delivery[],
+    vehicles: Vehicle[],
+    constraints: OptimizationConstraints
+  ): Promise<OptimizedRoute[]> {
+    // Pre-process deliveries and constraints
+    const processedDeliveries = await this.preprocessDeliveries(deliveries);
+    const realTimeConstraints = await this.getRealTimeConstraints();
+
+    // Generate initial population
+    const population = this.generateInitialPopulation(
+      processedDeliveries,
+      vehicles
+    );
+
+    // Run genetic algorithm with fitness function
+    const optimizedRoutes = await this.geneticAlgorithm.evolve(
+      population,
+      (route) => this.calculateFitness(route, realTimeConstraints, constraints)
+    );
+
+    return this.postProcessRoutes(optimizedRoutes);
+  }
+
+  private async calculateFitness(
+    route: Route,
+    realTimeConstraints: RealTimeConstraints,
+    constraints: OptimizationConstraints
+  ): Promise<number> {
+    let fitness = 0;
+
+    // Distance optimization (40% weight)
+    const totalDistance = this.calculateTotalDistance(route);
+    fitness += (1 / totalDistance) * 0.4;
+
+    // Time window compliance (25% weight)
+    const timeWindowScore = this.calculateTimeWindowCompliance(route);
+    fitness += timeWindowScore * 0.25;
+
+    // Traffic conditions (20% weight)
+    const trafficScore = await this.calculateTrafficScore(
+      route,
+      realTimeConstraints
+    );
+    fitness += trafficScore * 0.2;
+
+    // Vehicle capacity utilization (15% weight)
+    const capacityScore = this.calculateCapacityUtilization(route);
+    fitness += capacityScore * 0.15;
+
+    return fitness;
+  }
+
+  private async getRealTimeConstraints(): Promise<RealTimeConstraints> {
+    const [trafficData, weatherData] = await Promise.all([
+      this.trafficService.getCurrentTrafficConditions(),
+      this.weatherService.getWeatherForecast(),
+    ]);
+
+    return {
+      trafficConditions: trafficData,
+      weatherConditions: weatherData,
+      roadClosures: await this.trafficService.getRoadClosures(),
+      constructionZones: await this.trafficService.getConstructionZones(),
+    };
+  }
+}
+```
+
+### 3. Scalable Multi-Tenant Architecture with Data Isolation
+
+**Challenge**: Supporting multiple logistics companies on a single platform while ensuring complete data isolation and maintaining performance at scale.
+
+**Solution**: Implemented a sophisticated multi-tenant architecture with dynamic database partitioning and middleware-based access control:
+
+```typescript
+// Multi-Tenant Database Service
+@Injectable()
+export class MultiTenantDatabaseService {
+  private readonly tenantConnections: Map<string, Connection> = new Map();
+  private readonly connectionPool: Pool;
+
+  constructor(
+    private readonly configService: ConfigService,
+    private readonly tenantService: TenantService
+  ) {
+    this.connectionPool = new Pool({
+      max: 20,
+      min: 5,
+      acquireTimeoutMillis: 30000,
+      createTimeoutMillis: 30000,
+      destroyTimeoutMillis: 5000,
+      idleTimeoutMillis: 30000,
+      reapIntervalMillis: 1000,
+      createRetryIntervalMillis: 100,
+    });
+  }
+
+  async getTenantConnection(tenantId: string): Promise<Connection> {
+    if (this.tenantConnections.has(tenantId)) {
+      return this.tenantConnections.get(tenantId)!;
+    }
+
+    const tenant = await this.tenantService.findById(tenantId);
+    const connection = await this.createTenantConnection(tenant);
+
+    this.tenantConnections.set(tenantId, connection);
+    return connection;
+  }
+
+  private async createTenantConnection(tenant: Tenant): Promise<Connection> {
+    const connectionString = this.buildTenantConnectionString(tenant);
+
+    return new Connection({
+      url: connectionString,
+      options: {
+        useNewUrlParser: true,
+        useUnifiedTopology: true,
+        maxPoolSize: 10,
+        serverSelectionTimeoutMS: 5000,
+        socketTimeoutMS: 45000,
+        bufferMaxEntries: 0,
+      },
+    });
+  }
+
+  // Dynamic Query Builder with Tenant Isolation
+  async buildTenantQuery<T>(
+    tenantId: string,
+    model: Model<T>,
+    query: any = {}
+  ): Promise<Query<T>> {
+    const tenantConnection = await this.getTenantConnection(tenantId);
+    const tenantModel = tenantConnection.model(model.modelName, model.schema);
+
+    // Automatically inject tenant isolation
+    return tenantModel.find({
+      ...query,
+      tenantId: tenantId,
+    });
+  }
+}
+
+// Tenant-Aware Repository Pattern
+@Injectable()
+export class TenantAwareRepository<T> {
+  constructor(
+    private readonly multiTenantService: MultiTenantDatabaseService,
+    private readonly model: Model<T>
+  ) {}
+
+  async find(
+    tenantId: string,
+    filter: FilterQuery<T> = {},
+    options: QueryOptions = {}
+  ): Promise<T[]> {
+    const query = await this.multiTenantService.buildTenantQuery(
+      tenantId,
+      this.model,
+      filter
+    );
+
+    if (options.sort) query.sort(options.sort);
+    if (options.limit) query.limit(options.limit);
+    if (options.skip) query.skip(options.skip);
+
+    return query.exec();
+  }
+
+  async create(tenantId: string, data: Partial<T>): Promise<T> {
+    const tenantConnection = await this.multiTenantService.getTenantConnection(
+      tenantId
+    );
+    const tenantModel = tenantConnection.model(
+      this.model.modelName,
+      this.model.schema
+    );
+
+    return tenantModel.create({
+      ...data,
+      tenantId,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+  }
+}
+```
+
+### 4. High-Performance Delivery Status Synchronization
+
+**Challenge**: Maintaining consistent delivery status across multiple systems (mobile apps, web dashboards, external APIs) with minimal latency and zero data loss.
+
+**Solution**: Implemented an event-driven architecture with message queues and optimistic concurrency control:
+
+```typescript
+// Event-Driven Delivery Status Service
+@Injectable()
+export class DeliveryStatusService {
+  private readonly eventEmitter: EventEmitter;
+  private readonly messageQueue: Bull.Queue;
+  private readonly cacheService: CacheService;
+
+  constructor(
+    private readonly deliveryRepository: DeliveryRepository,
+    private readonly notificationService: NotificationService,
+    private readonly auditService: AuditService
+  ) {
+    this.eventEmitter = new EventEmitter();
+    this.messageQueue = new Bull("delivery-status-updates", {
+      redis: process.env.REDIS_URL,
+      defaultJobOptions: {
+        removeOnComplete: 100,
+        removeOnFail: 50,
+        attempts: 3,
+        backoff: {
+          type: "exponential",
+          delay: 2000,
+        },
+      },
+    });
+
+    this.initializeEventHandlers();
+    this.initializeQueueProcessors();
+  }
+
+  async updateDeliveryStatus(
+    deliveryId: string,
+    status: DeliveryStatus,
+    metadata: StatusUpdateMetadata
+  ): Promise<DeliveryStatusUpdate> {
+    // Optimistic locking with version control
+    const delivery = await this.deliveryRepository.findById(deliveryId);
+    const currentVersion = delivery.version;
+
+    const updateResult = await this.deliveryRepository.findOneAndUpdate(
+      { _id: deliveryId, version: currentVersion },
+      {
+        $set: {
+          status,
+          lastStatusUpdate: new Date(),
+          ...metadata,
+        },
+        $inc: { version: 1 },
+      },
+      { new: true }
+    );
+
+    if (!updateResult) {
+      throw new ConcurrencyError("Delivery was modified by another operation");
+    }
+
+    // Emit event for real-time updates
+    this.eventEmitter.emit("delivery.status.updated", {
+      deliveryId,
+      status,
+      metadata,
+      timestamp: new Date(),
+    });
+
+    // Queue for async processing
+    await this.messageQueue.add("process-status-update", {
+      deliveryId,
+      status,
+      metadata,
+      timestamp: new Date(),
+    });
+
+    // Update cache immediately
+    await this.cacheService.set(
+      `delivery:${deliveryId}:status`,
+      { status, metadata, timestamp: new Date() },
+      300 // 5 minutes TTL
+    );
+
+    return updateResult;
+  }
+
+  private async initializeQueueProcessors(): Promise<void> {
+    // Process status updates
+    this.messageQueue.process("process-status-update", async (job) => {
+      const { deliveryId, status, metadata } = job.data;
+
+      try {
+        // Update external systems
+        await Promise.all([
+          this.notificationService.notifyStatusChange(deliveryId, status),
+          this.auditService.logStatusChange(deliveryId, status, metadata),
+          this.updateExternalAPIs(deliveryId, status),
+        ]);
+
+        // Update analytics
+        await this.updateAnalytics(deliveryId, status);
+      } catch (error) {
+        this.logger.error(`Failed to process status update: ${error.message}`);
+        throw error; // Retry job
+      }
+    });
+
+    // Handle failed jobs
+    this.messageQueue.on("failed", (job, err) => {
+      this.logger.error(`Job ${job.id} failed: ${err.message}`);
+      // Send alert for critical failures
+      if (job.attemptsMade >= job.opts.attempts) {
+        this.alertService.sendCriticalAlert("Status update processing failed", {
+          jobId: job.id,
+          error: err.message,
+          data: job.data,
+        });
+      }
+    });
+  }
+}
+```
+
+### 5. Intelligent ETA Calculation with Machine Learning
+
+**Challenge**: Providing accurate ETA predictions that account for historical patterns, real-time conditions, and driver behavior.
+
+**Solution**: Implemented a machine learning pipeline with ensemble models and real-time feature engineering:
+
+```typescript
+// ML-Powered ETA Prediction Service
+@Injectable()
+export class ETAPredictionService {
+  private readonly mlModel: TensorFlowModel;
+  private readonly featureEngine: FeatureEngine;
+  private readonly historicalDataService: HistoricalDataService;
+
+  constructor(
+    private readonly trafficService: TrafficService,
+    private readonly weatherService: WeatherService,
+    private readonly driverService: DriverService
+  ) {
+    this.mlModel = new TensorFlowModel();
+    this.featureEngine = new FeatureEngine();
+    this.initializeModel();
+  }
+
+  async predictETA(
+    delivery: Delivery,
+    currentLocation: GPSLocation,
+    driverId: string
+  ): Promise<ETAPrediction> {
+    // Extract features
+    const features = await this.extractFeatures(
+      delivery,
+      currentLocation,
+      driverId
+    );
+
+    // Get base prediction from ML model
+    const basePrediction = await this.mlModel.predict(features);
+
+    // Apply real-time adjustments
+    const adjustedPrediction = await this.applyRealTimeAdjustments(
+      basePrediction,
+      delivery,
+      currentLocation
+    );
+
+    // Calculate confidence interval
+    const confidenceInterval = this.calculateConfidenceInterval(
+      adjustedPrediction,
+      features
+    );
+
+    return {
+      estimatedTime: adjustedPrediction,
+      confidence: confidenceInterval.confidence,
+      range: {
+        min: confidenceInterval.min,
+        max: confidenceInterval.max,
+      },
+      factors: this.extractInfluencingFactors(features),
+      lastUpdated: new Date(),
+    };
+  }
+
+  private async extractFeatures(
+    delivery: Delivery,
+    currentLocation: GPSLocation,
+    driverId: string
+  ): Promise<FeatureVector> {
+    const [
+      trafficConditions,
+      weatherConditions,
+      driverProfile,
+      historicalData,
+      routeComplexity,
+    ] = await Promise.all([
+      this.trafficService.getRouteTrafficConditions(
+        currentLocation,
+        delivery.deliveryAddress
+      ),
+      this.weatherService.getWeatherConditions(delivery.deliveryAddress),
+      this.driverService.getDriverProfile(driverId),
+      this.historicalDataService.getHistoricalDeliveryData(
+        delivery.deliveryAddress,
+        driverId
+      ),
+      this.calculateRouteComplexity(delivery),
+    ]);
+
+    return this.featureEngine.buildFeatureVector({
+      distance: this.calculateDistance(
+        currentLocation,
+        delivery.deliveryAddress
+      ),
+      trafficConditions,
+      weatherConditions,
+      driverProfile,
+      historicalData,
+      routeComplexity,
+      timeOfDay: new Date().getHours(),
+      dayOfWeek: new Date().getDay(),
+      packageWeight: delivery.packageWeight,
+      priority: delivery.priority,
+    });
+  }
+
+  private async applyRealTimeAdjustments(
+    basePrediction: number,
+    delivery: Delivery,
+    currentLocation: GPSLocation
+  ): Promise<number> {
+    let adjustedTime = basePrediction;
+
+    // Traffic adjustment
+    const trafficMultiplier = await this.calculateTrafficMultiplier(
+      currentLocation,
+      delivery.deliveryAddress
+    );
+    adjustedTime *= trafficMultiplier;
+
+    // Weather adjustment
+    const weatherMultiplier = await this.calculateWeatherMultiplier(
+      delivery.deliveryAddress
+    );
+    adjustedTime *= weatherMultiplier;
+
+    // Time window constraints
+    if (delivery.timeWindow) {
+      adjustedTime = this.adjustForTimeWindow(
+        adjustedTime,
+        delivery.timeWindow
+      );
+    }
+
+    return Math.max(adjustedTime, 1); // Minimum 1 minute
+  }
+
+  private calculateConfidenceInterval(
+    prediction: number,
+    features: FeatureVector
+  ): ConfidenceInterval {
+    // Calculate confidence based on feature quality and historical accuracy
+    const featureQuality = this.calculateFeatureQuality(features);
+    const historicalAccuracy = this.getHistoricalAccuracy(features);
+
+    const confidence = (featureQuality + historicalAccuracy) / 2;
+    const margin = prediction * (1 - confidence) * 0.2; // 20% margin
+
+    return {
+      confidence,
+      min: Math.max(prediction - margin, 1),
+      max: prediction + margin,
+    };
+  }
+}
+```
+
+### 6. Robust Error Handling and Circuit Breaker Pattern
+
+**Challenge**: Maintaining system reliability when external services (maps, weather, SMS) are unavailable or slow.
+
+**Solution**: Implemented comprehensive error handling with circuit breakers, fallbacks, and graceful degradation:
+
+```typescript
+// Circuit Breaker Service
+@Injectable()
+export class CircuitBreakerService {
+  private readonly breakers: Map<string, CircuitBreaker> = new Map();
+  private readonly fallbackStrategies: Map<string, FallbackStrategy> =
+    new Map();
+
+  constructor(
+    private readonly cacheService: CacheService,
+    private readonly alertService: AlertService
+  ) {
+    this.initializeCircuitBreakers();
+  }
+
+  private initializeCircuitBreakers(): void {
+    // Maps API circuit breaker
+    this.breakers.set(
+      "maps-api",
+      new CircuitBreaker({
+        failureThreshold: 5,
+        recoveryTimeout: 30000,
+        monitorInterval: 10000,
+        timeout: 5000,
+      })
+    );
+
+    // Weather API circuit breaker
+    this.breakers.set(
+      "weather-api",
+      new CircuitBreaker({
+        failureThreshold: 3,
+        recoveryTimeout: 60000,
+        monitorInterval: 15000,
+        timeout: 3000,
+      })
+    );
+
+    // SMS API circuit breaker
+    this.breakers.set(
+      "sms-api",
+      new CircuitBreaker({
+        failureThreshold: 10,
+        recoveryTimeout: 120000,
+        monitorInterval: 30000,
+        timeout: 2000,
+      })
+    );
+  }
+
+  async executeWithCircuitBreaker<T>(
+    serviceName: string,
+    operation: () => Promise<T>,
+    fallback?: () => Promise<T>
+  ): Promise<T> {
+    const breaker = this.breakers.get(serviceName);
+
+    if (!breaker) {
+      return operation();
+    }
+
+    try {
+      return await breaker.execute(operation);
+    } catch (error) {
+      this.logger.warn(
+        `Circuit breaker triggered for ${serviceName}: ${error.message}`
+      );
+
+      // Execute fallback strategy
+      if (fallback) {
+        return await fallback();
+      }
+
+      // Use cached data as fallback
+      const cachedData = await this.getCachedFallback(serviceName);
+      if (cachedData) {
+        return cachedData;
+      }
+
+      throw new ServiceUnavailableError(
+        `${serviceName} is temporarily unavailable`
+      );
+    }
+  }
+
+  private async getCachedFallback<T>(serviceName: string): Promise<T | null> {
+    const cacheKey = `fallback:${serviceName}`;
+    return await this.cacheService.get(cacheKey);
+  }
+}
+
+// Robust External Service Integration
+@Injectable()
+export class ExternalServiceIntegration {
+  constructor(
+    private readonly circuitBreaker: CircuitBreakerService,
+    private readonly cacheService: CacheService
+  ) {}
+
+  async getRouteOptimization(
+    waypoints: GPSLocation[],
+    constraints: RouteConstraints
+  ): Promise<OptimizedRoute> {
+    return this.circuitBreaker.executeWithCircuitBreaker(
+      "maps-api",
+      async () => {
+        const response = await this.mapsAPI.optimizeRoute(
+          waypoints,
+          constraints
+        );
+        await this.cacheService.set(
+          `route:${this.generateRouteKey(waypoints, constraints)}`,
+          response,
+          3600 // 1 hour cache
+        );
+        return response;
+      },
+      async () => {
+        // Fallback to cached route or simplified algorithm
+        const cachedRoute = await this.cacheService.get(
+          `route:${this.generateRouteKey(waypoints, constraints)}`
+        );
+
+        if (cachedRoute) {
+          return cachedRoute;
+        }
+
+        // Simplified route calculation
+        return this.calculateSimplifiedRoute(waypoints);
+      }
+    );
+  }
+
+  async sendDeliveryNotification(
+    deliveryId: string,
+    notification: DeliveryNotification
+  ): Promise<void> {
+    await this.circuitBreaker.executeWithCircuitBreaker(
+      "sms-api",
+      async () => {
+        await this.smsService.send(notification);
+      },
+      async () => {
+        // Fallback to email or push notification
+        await this.notificationService.sendEmailNotification(notification);
+        await this.notificationService.sendPushNotification(notification);
+      }
+    );
+  }
+}
+```
+
 ## 📁 Project Structure
 
 ```
@@ -396,32 +1100,6 @@ logistics-backend/
 ├── jest.config.js            # Jest testing configuration
 └── README.md                 # This file
 ```
-
-## 🧪 Testing
-
-### Running Tests
-
-```bash
-# Run all tests
-npm test
-
-# Run tests in watch mode
-npm run test:watch
-
-# Run tests with coverage
-npm run test:coverage
-
-# Run specific test suites
-npm run test:unit
-npm run test:integration
-npm run test:e2e
-```
-
-### Test Structure
-
-- **Unit Tests**: Test individual functions and methods
-- **Integration Tests**: Test API endpoints and database operations
-- **E2E Tests**: Test complete user workflows
 
 ## 🚀 Deployment
 
@@ -503,53 +1181,6 @@ npm run migrate:up
 npm run migrate:down
 ```
 
-## 🤝 Contributing
-
-We welcome contributions! Please follow these steps:
-
-### 1. Fork the Repository
-
-```bash
-git clone https://github.com/your-username/logistics-backend.git
-cd logistics-backend
-```
-
-### 2. Create a Feature Branch
-
-```bash
-git checkout -b feature/amazing-feature
-```
-
-### 3. Make Your Changes
-
-- Write clean, documented code
-- Add tests for new functionality
-- Update documentation as needed
-- Follow the existing code style
-
-### 4. Test Your Changes
-
-```bash
-npm run lint
-npm test
-npm run test:coverage
-```
-
-### 5. Submit a Pull Request
-
-- Provide a clear description of your changes
-- Include any relevant issue numbers
-- Ensure all tests pass
-- Update documentation if needed
-
-### Development Guidelines
-
-- **Code Style**: Follow TypeScript best practices and ESLint rules
-- **Testing**: Maintain >90% test coverage
-- **Documentation**: Update API documentation for new endpoints
-- **Commits**: Use conventional commit messages
-- **Reviews**: All PRs require at least one review
-
 ## 📊 Performance & Monitoring
 
 ### Performance Metrics
@@ -616,61 +1247,3 @@ GET /api/v1/health/detailed # Detailed system status
 - [ ] **Database Optimization**: Query optimization and indexing
 - [ ] **CDN Integration**: Static asset delivery optimization
 - [ ] **Load Balancing**: Horizontal scaling support
-
-## 📞 Support
-
-### Getting Help
-
-- **Documentation**: Check the `/docs` folder for detailed guides
-- **Issues**: Report bugs and request features via GitHub Issues
-- **Discussions**: Join community discussions on GitHub Discussions
-- **Email**: Contact us at support@logistics-backend.com
-
-### Community
-
-- **GitHub**: [https://github.com/your-username/logistics-backend](https://github.com/your-username/logistics-backend)
-- **Discussions**: [https://github.com/your-username/logistics-backend/discussions](https://github.com/your-username/logistics-backend/discussions)
-- **Wiki**: [https://github.com/your-username/logistics-backend/wiki](https://github.com/your-username/logistics-backend/wiki)
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-### License Summary
-
-```
-MIT License
-
-Copyright (c) 2024 Logistics Backend
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
-
-## 🙏 Acknowledgments
-
-- **Express.js** - Fast, unopinionated web framework
-- **MongoDB** - NoSQL database for scalable data storage
-- **JWT** - JSON Web Tokens for secure authentication
-- **Docker** - Containerization platform
-- **GitHub Actions** - CI/CD automation
-- **TypeScript** - Type-safe JavaScript development
-
----
-
-**Built with ❤️ using Node.js, Express, MongoDB, and TypeScript**
